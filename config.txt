@@ -1,0 +1,8 @@
+# Costs from A to B, C, D, E
+5 1 -1 -1
+# Costs from B to C, D, E
+2 4 -1
+# Costs from C to D, E
+-1 1
+# Costs from D to E
+7
