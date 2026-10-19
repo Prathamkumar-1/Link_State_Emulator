@@ -5,7 +5,7 @@ import struct
 from pathlib import Path
 import numpy as np
 
-HOST = "0.0.0.0"
+HOST = ""
 PORT = 5000
 
 
@@ -31,7 +31,6 @@ def parse_content(content):
 
 
 def get_link_state_tuples(matrix, node_letter, registry):
-    """Returns [(letter, ip, port, cost), ...] for node_letter."""
     n = len(matrix)
     idx = ord(node_letter) - ord('A')
 

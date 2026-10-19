@@ -9,19 +9,49 @@
 #include <string>
 #include <vector>
 
-static const uint16_t ORACLE_PORT = 5000;
-static const uint8_t MSG_CONNECT = 1;
-static const uint8_t MSG_LINK_STATE = 2;
-static const size_t HEADER_LEN = 3;
+using namespace std;
+
+const int ORACLE_PORT = 5000;
+const int MSG_CONNECT = 1;
+const int MSG_LINK_STATE = 2;
+const int HEADER_LEN = 3;
+const int MAX_NODES = 26;
+const int LSP_INTERVAL = 15; // seconds between re-sends of my own LSP
+const int PRINT_INTERVAL = 15; // seconds between graph printouts
+const int LSP_COPY = 2; // send each LSP this many times 
 
 struct Tuple {
     char letter;
-    std::string ip;
-    uint16_t port;
-    uint16_t cost;
+    string ip;
+    int port;
+    int cost;
 };
 
-int make_udp_socket(const std::string& ip, uint16_t port) {
+struct Link {
+    char letter;
+    int cost;
+};
+
+struct LsdbEntry {
+    bool known = false;
+    unsigned int seq = 0;
+    vector<Link> links;
+};
+
+struct VNstate {
+    char my_letter = 0;
+    string my_ip;
+    int my_port = 0;
+    vector<Tuple> neighbours;
+    unsigned int my_seq = 0;
+    LsdbEntry lsdb[MAX_NODES];
+    int last_lsp_time = 0;
+    int last_print_time = 0;
+};
+
+
+
+int make_udp_socket(string& ip, int port) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     
     struct sockaddr_in addr{};
@@ -36,7 +66,7 @@ int make_udp_socket(const std::string& ip, uint16_t port) {
     return fd;
 }
 
-int connect_to_oracle(const std::string& oracle_ip) {
+int connect_to_oracle(string& oracle_ip) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
     struct sockaddr_in addr{};
@@ -51,7 +81,7 @@ int connect_to_oracle(const std::string& oracle_ip) {
     return fd;
 }
 
-void send_connect(int tcp_fd, const std::string& my_ip, uint16_t my_port) {
+void send_connect(int tcp_fd, string& my_ip, int my_port) {
     uint8_t msg[9] = {MSG_CONNECT, 0, 6}; // Header
     
     inet_pton(AF_INET, my_ip.c_str(), &msg[3]);
@@ -65,9 +95,153 @@ void send_connect(int tcp_fd, const std::string& my_ip, uint16_t my_port) {
     send(tcp_fd, msg, 9, 0);
 }
 
-void handle_link_state(const std::vector<uint8_t>& body) {
+vector<uint8_t> pack_lsp(char origin, unsigned int seq, vector<Link>& links){
+ vector<uint8_t> msg;
+ msg.push_back(static_cast<uint8_t>(origin));
+ msg.push_back((seq >> 24) && 0XFF);
+ msg.push_back((seq >> 16) && 0XFF);
+ msg.push_back((seq >> 8) && 0XFF);
+ msg.push_back(seq && 0XFF);
+ msg.push_back(static_cast<uint8_t>(links.size()));
+
+ for(auto& link : links){
+    msg.push_back(static_cast<uint8_t>(link.letter));
+    msg.push_back((link.cost >> 8) && 0XFF);
+    msg.push_back(link.cost && 0XFF);
+ }
+ return msg;
+}
+
+bool parse_Lsp(uint8_t* data, int len, char& origin, unsigned int& seq, vector<Link>& links){
+   if(len < 6) return false;
+
+   origin = static_cast<char>(data[0]);
+   if(origin < 'A' || origin > 'Z') return false;
+
+   seq = (static_cast<unsigned int>(data[1]) << 24) |
+         (static_cast<unsigned int>(data[2]) << 16) |
+         (static_cast<unsigned int>(data[3]) << 8) |
+         static_cast<unsigned int>(data[4]);
+    int count = data[5];
+    if(count > MAX_NODES || len != 6 + count * 3) return false;
+    links.clear();
+
+    int offset = 6;
+    for(int i=0; i< count ; i++){
+        char letter = static_cast<char>(data[offset]);
+        int cost = (data[offset + 1] << 8) | data[offset + 2];
+        if(letter < 'A' || letter > 'Z') return false;
+        links.push_back({letter, cost});
+        offset += 3;
+    }
+    return true;
+}
+
+void send_to_neighbours(int udp_fd, VNstate& st, const vector<uint8_t>& msg,char except){
+   for(const auto& neighbour : st.neighbours){
+    if(except !=0 && neighbour.letter == except) continue;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(neighbour.port);
+    if(inet_pton(AF_INET, neighbour.ip.c_str(), &addr.sin_addr) <= 0){
+        continue;
+    }
+    for(int i=0; i< LSP_COPY; i++){
+        int sent = sendto(udp_fd, msg.data(), msg.size(), 0, (struct sockaddr*)&addr, sizeof(addr));
+        if(sent < 0){
+            perror("sendto failed");
+        }
+    }
+   }
+}
+
+void originate_lsp(int udp_fd, VNstate& st){
+   if(st.my_letter < 'A' || st.my_letter > 'Z') return;
+   vector<int> links;
+   for(const auto& neighbour : st.neighbours){
+    links.push_back({neighbour.letter, neighbour.cost});
+   }
+
+   st.my_seq++;
+   int index = st.my_letter - 'A';
+   st.lsdb[index].known = true;
+   st.lsdb[index].seq = st.my_seq;
+   st.lsdb[index].links = links;
+
+   vector<uint8_t> msg = pack_lsp(st.my_letter, st.my_seq, links);
+   send_to_neighbours(udp_fd, st, msg, 0);
+   st.last_lsp_time = time(nullptr);
+}
+
+void handle_udp(int udp_fd, VNstate& st){
+    uint8_t buffer [1024];
+    sockaddr_in sender{};
+    socklen_t sender_len = sizeof(sender);
+    int bytes = recvfrom(udp_fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&sender, &sender_len);
+    if(bytes <= 0) return;
+    char origin;
+    unsigned int seq;
+    vector<link> links;
+    if(!parse_lsp(buffer,static_cast<int>(bytes),origin,seq,links)) return;
+    int index = origin - 'A';
+    if(st.lsdb[index].known && seq <= st.lsdb[index].seq) return;
+    st.lsdb[index].known = true;
+    st.lsdb[index].seq = seq;
+    st.lsdb[index].links = links;
+    char sender_letter = 0;
+    char sender_ip[INET_ADDRSTRLEN];
+    if(inet_ntop(AF_INET, &sender.sin_addr, sender_ip, sizeof(sender_ip)) != nullptr){
+        for(const auto& neighbour : st.neighbours){
+            if(neighbour.ip == sender_ip && neighbour.port == ntohs(sender.sin_port)){
+                sender_letter = neighbour.letter;
+                break;
+            }
+        }
+    }
+
+    vector<uint8_t> msg = pack_lsp(origin, seq, links);
+    send_to_neighbours(udp_fd, st, msg, sender_letter);
+}
+
+void print_graph(VNstate& st){
+    int highest = -1;
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (st.lsdb[i].known) highest = i;
+    }
+    if (highest < 0) return;
+
+    int graph[MAX_NODES][MAX_NODES];
+    for (int i = 0; i <= highest; i++) {
+        for (int j = 0; j <= highest; j++) {
+            graph[i][j] = (i == j) ? 0 : -1;
+        }
+    }
+
+    // Use each origin's own report. If only one endpoint is known, mirror its cost.
+    for (int i = 0; i <= highest; i++) {
+        if (!st.lsdb[i].known) continue;
+        for (const auto& link : st.lsdb[i].links) {
+            int j = link.letter - 'A';
+            if (j < 0 || j > highest || j == i) continue;
+            graph[i][j] = link.cost;
+            if (graph[j][i] == -1) graph[j][i] = link.cost;
+        }
+    }
+
+    printf("Known link-state graph (-1 means unknown/no link):\n    ");
+    for (int j = 0; j <= highest; j++) printf("%c ", 'A' + j);
+    printf("\n");
+    for (int i = 0; i <= highest; i++) {
+        printf("%c:  ", 'A' + i);
+        for (int j = 0; j <= highest; j++) printf("%d ", graph[i][j]);
+        printf("\n");
+    }
+}
+
+void handle_link_state(vector<uint8_t>& body) {
     int count = body[0];
-    std::vector<Tuple> tuples(count);
+    vector<Tuple> tuples(count);
     int offset = 1;
 
     for (int i = 0; i < count; i++) {
@@ -82,7 +256,7 @@ void handle_link_state(const std::vector<uint8_t>& body) {
         offset += 9;
     }
 
-    std::string out;
+    string out;
     // Print self (cost 0) first
     for (const auto& t : tuples) {
         if (t.cost == 0) out += std::string(1, t.letter) + "=0";
@@ -93,14 +267,18 @@ void handle_link_state(const std::vector<uint8_t>& body) {
     }
 
     printf("LINK-STATE: %s\n", out.c_str());
+
+
+    (void)st;
+    (void)udp_fd;
 }
 
-void process_buffer(std::vector<uint8_t>& buf) {
+void process_buffer(vector<uint8_t>& buf) {
     while (buf.size() >= HEADER_LEN) {
         uint8_t type = buf[0];
         int body_len = (buf[1] << 8) | buf[2];
 
-        if (buf.size() < HEADER_LEN + body_len) break; // wait for more data
+        if (buf.size() < HEADER_LEN + body_len) break; 
 
         std::vector<uint8_t> body(buf.begin() + HEADER_LEN, buf.begin() + HEADER_LEN + body_len);
         buf.erase(buf.begin(), buf.begin() + HEADER_LEN + body_len);
@@ -117,24 +295,26 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string oracle_ip = argv[1];
-    std::string my_ip = argv[2];
-    uint16_t my_port = atoi(argv[3]);
+    string oracle_ip = argv[1];
+    string my_ip = argv[2];
+    int my_port = atoi(argv[3]);
 
     int udp_fd = make_udp_socket(my_ip, my_port);
     int tcp_fd = connect_to_oracle(oracle_ip);
     send_connect(tcp_fd, my_ip, my_port);
 
-    std::vector<uint8_t> rx_buf;
+    vector<uint8_t> rx_buf;
 
     while (true) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(tcp_fd, &readfds);
-
+        FD_SET(udp_fd, &readfds);
+        int maxfd = max(tcp_fd,udp_fd);
+        
         struct timeval timeout{1, 0}; // 1 second timeout
         
-        if (select(tcp_fd + 1, &readfds, nullptr, nullptr, &timeout) < 0) {
+        if (select(maxfd + 1, &readfds, nullptr, nullptr, &timeout) < 0) {
             perror("select");
             break;
         }
@@ -149,7 +329,21 @@ int main(int argc, char* argv[]) {
             }
 
             rx_buf.insert(rx_buf.end(), temp, temp + bytes);
-            process_buffer(rx_buf);
+            process_buffer(rx_buf,st, udp_fd);
+        }
+
+        if(FD_ISSET(udp_fd,&readfds)){
+            handle_udp(udp_fd,st);
+        }
+
+        int now = time(nullptr);
+        if(st.my_letter !=0 && now - st.last_lsp_time >= LSP_INTERVAL){
+            originate_lsp(udp_fd,st);
+            st.last_lsp_time = now;
+        }
+        if(now - st.last.print_time >= PRINT_INTERVAL){
+            print_graph(st);
+            st.last_print_time = now;
         }
     }
 
