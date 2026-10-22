@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 
-HOST = "0.0.0.0"
+HOST = "10.51.14.255"
 PORT = 5000
 
 
