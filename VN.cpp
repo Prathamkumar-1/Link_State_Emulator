@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <ctime>
+
 
 using namespace std;
 
@@ -48,7 +51,6 @@ struct VNstate {
     int last_lsp_time = 0;
     int last_print_time = 0;
 };
-
 
 
 int make_udp_socket(string& ip, int port) {
@@ -98,16 +100,16 @@ void send_connect(int tcp_fd, string& my_ip, int my_port) {
 vector<uint8_t> pack_lsp(char origin, unsigned int seq, vector<Link>& links){
  vector<uint8_t> msg;
  msg.push_back(static_cast<uint8_t>(origin));
- msg.push_back((seq >> 24) && 0XFF);
- msg.push_back((seq >> 16) && 0XFF);
- msg.push_back((seq >> 8) && 0XFF);
- msg.push_back(seq && 0XFF);
+ msg.push_back((seq >> 24) & 0XFF);
+ msg.push_back((seq >> 16) & 0XFF);
+ msg.push_back((seq >> 8) & 0XFF);
+ msg.push_back(seq & 0XFF);
  msg.push_back(static_cast<uint8_t>(links.size()));
 
  for(auto& link : links){
     msg.push_back(static_cast<uint8_t>(link.letter));
-    msg.push_back((link.cost >> 8) && 0XFF);
-    msg.push_back(link.cost && 0XFF);
+    msg.push_back((link.cost >> 8) & 0XFF);
+    msg.push_back(link.cost & 0XFF);
  }
  return msg;
 }
@@ -158,7 +160,7 @@ void send_to_neighbours(int udp_fd, VNstate& st, const vector<uint8_t>& msg,char
 
 void originate_lsp(int udp_fd, VNstate& st){
    if(st.my_letter < 'A' || st.my_letter > 'Z') return;
-   vector<int> links;
+   vector<Link> links;
    for(const auto& neighbour : st.neighbours){
     links.push_back({neighbour.letter, neighbour.cost});
    }
@@ -182,8 +184,8 @@ void handle_udp(int udp_fd, VNstate& st){
     if(bytes <= 0) return;
     char origin;
     unsigned int seq;
-    vector<link> links;
-    if(!parse_lsp(buffer,static_cast<int>(bytes),origin,seq,links)) return;
+    vector<Link> links;
+    if(!parse_Lsp(buffer,static_cast<int>(bytes),origin,seq,links)) return;
     int index = origin - 'A';
     if(st.lsdb[index].known && seq <= st.lsdb[index].seq) return;
     st.lsdb[index].known = true;
@@ -200,7 +202,7 @@ void handle_udp(int udp_fd, VNstate& st){
         }
     }
 
-    vector<uint8_t> msg = pack_lsp(origin, seq, links);
+    vector<uint8_t> msg(buffer , buffer + bytes);
     send_to_neighbours(udp_fd, st, msg, sender_letter);
 }
 
@@ -225,7 +227,7 @@ void print_graph(VNstate& st){
             int j = link.letter - 'A';
             if (j < 0 || j > highest || j == i) continue;
             graph[i][j] = link.cost;
-            if (graph[j][i] == -1) graph[j][i] = link.cost;
+            if (!st.lsdb[j].known && graph[j][i] == -1) graph[j][i] = link.cost;
         }
     }
 
@@ -239,8 +241,9 @@ void print_graph(VNstate& st){
     }
 }
 
-void handle_link_state(vector<uint8_t>& body) {
+void handle_link_state(vector<uint8_t>& body, VNstate& st, int udp_fd) {
     int count = body[0];
+    if(count > MAX_NODES || body.size() < 1 + count * 9) return;
     vector<Tuple> tuples(count);
     int offset = 1;
 
@@ -267,24 +270,30 @@ void handle_link_state(vector<uint8_t>& body) {
     }
 
     printf("LINK-STATE: %s\n", out.c_str());
+    st.neighbours.clear();
 
+    for(const auto& t : tuples){
+        if(t.cost == 0) st.my_letter = t.letter;
+        else st.neighbours.push_back(t);
+    }
 
-    (void)st;
-    (void)udp_fd;
+    if(st.my_letter >= 'A' && st.my_letter <= 'Z'){
+        originate_lsp(udp_fd,st);
+    }
 }
 
-void process_buffer(vector<uint8_t>& buf) {
+void process_buffer(vector<uint8_t>& buf, VNstate& st, int udp_fd) {
     while (buf.size() >= HEADER_LEN) {
         uint8_t type = buf[0];
         int body_len = (buf[1] << 8) | buf[2];
 
         if (buf.size() < HEADER_LEN + body_len) break; 
 
-        std::vector<uint8_t> body(buf.begin() + HEADER_LEN, buf.begin() + HEADER_LEN + body_len);
+        vector<uint8_t> body(buf.begin() + HEADER_LEN, buf.begin() + HEADER_LEN + body_len);
         buf.erase(buf.begin(), buf.begin() + HEADER_LEN + body_len);
 
         if (type == MSG_LINK_STATE) {
-            handle_link_state(body);
+            handle_link_state(body,st, udp_fd);
         }
     }
 }
@@ -302,6 +311,12 @@ int main(int argc, char* argv[]) {
     int udp_fd = make_udp_socket(my_ip, my_port);
     int tcp_fd = connect_to_oracle(oracle_ip);
     send_connect(tcp_fd, my_ip, my_port);
+
+    VNstate st;
+    st.my_ip = my_ip;
+    st.my_port = my_port;
+    st.last_print_time = time(nullptr);
+    st.last_lsp_time = time(nullptr);
 
     vector<uint8_t> rx_buf;
 
@@ -341,7 +356,7 @@ int main(int argc, char* argv[]) {
             originate_lsp(udp_fd,st);
             st.last_lsp_time = now;
         }
-        if(now - st.last.print_time >= PRINT_INTERVAL){
+        if(now - st.last_print_time >= PRINT_INTERVAL){
             print_graph(st);
             st.last_print_time = now;
         }
