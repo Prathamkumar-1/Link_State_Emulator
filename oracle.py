@@ -4,7 +4,7 @@ import select
 import struct
 from pathlib import Path
 
-HOST = ""
+HOST = "192.168.153.181"
 PORT = 5000
 
 
