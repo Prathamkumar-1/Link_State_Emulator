@@ -130,7 +130,10 @@ def run_oracle(filename):
                     broadcast(clients, matrix)
 
                 # config reload -> resend to everyone
-                current_modified = path.stat().st_mtime_ns
+                try:
+                    current_modified = path.stat().st_mtime_ns
+                except OSError:
+                    continue
                 if current_modified != last_modified:
                     last_modified = current_modified
                     matrix = parse_content(path.read_text(encoding="utf-8"))
